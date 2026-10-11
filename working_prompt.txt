@@ -1,0 +1,153 @@
+Reusable prompt / spec document
+
+Copy everything between the --- markers. It's written so an AI with no context can rebuild or extend the plugin.
+
+PROJECT: River Reconditioner — a QGIS plugin
+
+Target: QGIS 3.28+ (developed and tested on 3.44) on Windows. UI in English. Distributed as a plugin folder, installable by copying into %APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\river_reconditioner\ and enabling from Plugins → Manage and Install Plugins.
+
+Purpose: Given a DEM (GeoTIFF, in meters) and a single river line (vector, projected CRS, meters), the tool removes artificial obstructions (bridges, weirs, culverts, embankments) from the DEM by replacing cross-sections of the raster with user-defined or user-drawn shapes, and writes a *_reconditioned.tif. It is meant for hydraulic modeling where the DEM contains structures that are not physically part of the riverbed.
+
+Environment constraints
+
+    QGIS 3.28–3.44. Python 3.9+ (as bundled with QGIS).
+
+    Allowed libraries: numpy, scipy (interpolate), matplotlib (embedded via FigureCanvasQTAgg), shapely, osgeo.gdal / osgeo.ogr, qgis.PyQt.
+
+    CRS must be projected and in meters. Geographic CRS is rejected at setup.
+
+    DEM and line must share the same CRS.
+
+    Line layer must contain exactly one feature per run.
+
+    DEM must be single-band, with a defined NoData value. If NoData is detected inside the corridor, abort with a clear message.
+
+Important GDAL workaround: on some Windows / OSGeo4W builds, ogr.CreateGeometryFromWkt() returns a generic osgeo.ogr.Geometry whose .Interpolate() method does not exist and whose GetGeometryType() does not compare equal to ogr.wkbLineString. Never use OGR for line interpolation. Use Shapely (shapely.wkt.loads, LineString.interpolate) via a single helper get_shapely_linestring() in core/line_utils.py. This helper also flattens MultiLineString parts, and raises a clear error if the parts are not contiguous.
+
+Workflow
+
+    Setup Dialog — drop-downs for line layer and DEM, spinbox for number of cross-sections (default 10, min 2), spinbox for half-width in meters (default 25, so full width = 50). On OK: validate CRS/units/NoData/single feature. Reverse the line if the start elevation is lower than the end (so chainage runs high → low). Sample the DEM along the line to build a longitudinal profile. Compute N cross-section center points at np.linspace(0, L, N). For each center, compute the perpendicular from the local tangent of the polyline (via Shapely). Build a temporary QGIS memory layer with N perpendicular LineStrings, attributes station (int) and chainage_m (double).
+
+    Profile Dialog — matplotlib canvas showing chainage (x) vs elevation (y) of the DEM. Overlay station markers as red dots with numbers. Buttons: "Recondition (remove lump)", "Burn channel…", and "Cancel" (which removes the temp layer).
+
+    Recondition Dialog (from the first button) — cuts a straight line between two anchor stations.
+
+        From-station drop-down, to-station drop-down (with each station's elevation shown in the label).
+
+        Width spinbox (default 25 m).
+
+        "Extra depth below bed" spinbox (default 0.0 — meaning the bed line sits exactly on the interpolated anchor elevations).
+
+        "Allow raise" checkbox (default off → applies min(original, new); on → free replacement to build walls).
+
+        Feathering: Hard edge, or Smooth + N meters (applied inside the corridor).
+
+        Burn resolution spinbox (default = DEM pixel size).
+
+        Output raster path (default <dem>_reconditioned.tif).
+
+        Preview checkbox (writes to /vsimem/, does not touch disk).
+
+        On Burn: build a linear bed from anchor elevations, sample a rectangular shape (width, extra depth) across it, densify along the chainage axis at ~200 stations, feed the resulting point cloud as points_override to core/burn.py::burn_dem(). The corridor mask is clamped to the override point bounding box (so no artificial extension before/after the anchors).
+
+    Burn Dialog (from the second button) — per-station channel shapes.
+
+        Table: Station | Chainage | Mode.
+
+        Modes: Average of neighbours (uses DEM at station ± Δ, default Δ = 10 m), User-drawn (interactive matplotlib), From CSV (offset_m,dz_m columns, offset 0 at the center, dz 0 = unchanged, negative = cut), Predefined catalogue (opens the Catalogue Dialog).
+
+        Buttons: Apply mode to selected station, Apply same mode to all stations, Open catalogue…
+
+        Catalogue dialog: shape preview on the left overlaid on the DEM cross-section at the current station, shape drop-down on the right (rectangular, triangular, trapezoidal, semicircular), spinboxes for parameters (defaults: rectangular 20×5, triangular 20×5, trapezoidal top 20 / bottom 8 / depth 5, semicircular width 20 → depth = width/2). Buttons: Apply to this station, Apply to all stations.
+
+        Common burn parameters: interpolation (2D griddata default, 1D along line), feathering (Hard edge / Smooth + N m), allow-raise checkbox, burn resolution, output raster path, cross-sections GPKG path, preview checkbox.
+
+        On Burn: for each station, get its shape as a list of (offset_m, dz_m) points, resample to a fixed offset grid, build a 3D point cloud of (x, y, datum + dz) where datum = DEM elevation at the center of the cross-section. Interpolate the cloud over the corridor using scipy.interpolate.griddata (linear, nearest fallback). Feather inside the corridor. Blend with the source DEM. Write GeoTIFF.
+
+Datum and units
+
+    All distances and elevations in meters.
+
+    Datum for each cross-section = DEM elevation at the line's center at that station.
+
+    Cross-section x = offset in meters from centerline. y = dz in meters relative to datum. Negative = cut, positive = raise.
+
+Burn rules
+
+    Output CRS, projection, and rotation terms of the geotransform must be preserved from the input DEM.
+
+    If burn resolution == source resolution, output raster has exactly the same geotransform and dimensions as the input.
+
+    If finer/coarser, scale only the linear part of the geotransform; keep the origin and rotation.
+
+    Bilinear sample source DEM on the target grid using the source geotransform's inverse.
+
+    Corridor mask from a shapely buffer around the line, or a bounding box for linear-bed mode.
+
+    Feathering applied as smoothstep inside the corridor. Hard edge = no feather.
+
+    Allow raise OFF → z_final = min(z_original, z_new); ON → z_final = z_new.
+
+    Output: GeoTIFF, Float32, LZW, TILED=YES.
+
+File layout
+text
+
+river_reconditioner/
+├── __init__.py                    # classFactory
+├── metadata.txt
+├── icon.png
+├── plugin.py                      # toolbar button, menu, provider registration
+├── processing_provider.py         # registers algorithm in Processing toolbox
+├── alg_recondition.py             # (optional) headless algorithm
+├── core/
+│   ├── __init__.py
+│   ├── dem_io.py                  # raster open, CRS checks, NoData, sampling
+│   ├── line_utils.py              # get_shapely_linestring + interpolation helpers
+│   ├── profile.py                 # sample DEM along line → ProfileResult
+│   ├── sections.py                # build N perpendicular cross-sections
+│   ├── shapes.py                  # rectangle/triangle/trapezoid/semicircle
+│   ├── longitudinal.py            # LinearBed, bed_from_stations
+│   ├── interpolation.py           # resample_profile, build_points_2d, build_linear_points
+│   ├── feather.py                 # smoothstep weights
+│   └── burn.py                    # burn_dem: read, interpolate, blend, write
+└── gui/
+    ├── __init__.py
+    ├── setup_dialog.py            # popup 1
+    ├── profile_dialog.py          # popup 2, with Recondition / Burn channel buttons
+    ├── recondition_dialog.py      # popup 3a (linear bed cut)
+    ├── burn_dialog.py             # popup 3b (per-station shapes)
+    ├── catalogue_dialog.py        # popup 4
+    └── widgets/
+        ├── __init__.py
+        ├── profile_canvas.py      # FigureCanvasQTAgg for the longitudinal profile
+        └── section_canvas.py      # FigureCanvasQTAgg for cross-sections
+
+Design principles
+
+    All math is in core/, GUI-free. Dialogs call core. The Processing algorithm (if added) also calls core.
+
+    No global state. Each dialog receives explicit objects (line layer, DEM layer, profile, sections).
+
+    Every validation error is a user-facing message. Never crash silently.
+
+    The metadata.txt must include: name, qgisMinimumVersion, description, version, author, email, icon, experimental.
+
+Extending the tool
+
+    To add a new shape to the catalogue, add a function to core/shapes.py::SHAPES returning a list of (offset_m, dz_m) and register it with its parameter spinboxes.
+
+    To add a new burn strategy, add a branch in core/interpolation.py and a drop-down entry in the burn dialog.
+
+    To support multi-line or multi-feature batches, iterate the profile and burn steps per feature; the core functions are already per-line.
+
+Known limitations (v0.1)
+
+    Single line feature per run.
+
+    Semicircular shape is currently a full half-circle; it should become an arc segment with a user-controlled diameter offset above the bed (not yet implemented).
+
+    User-drawn and CSV modes are wired in the UI but the drawing canvas is not yet interactive (only catalogue and average modes are fully functional).
+
+    No elevation-aware anchor selection; anchors must be chosen by the user from the station list.
+

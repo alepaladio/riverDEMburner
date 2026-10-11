@@ -1,0 +1,9 @@
+[general]
+name=River Reconditioner
+qgisMinimumVersion=3.0
+description=Reconditions a DEM along a river line by replacing cross-sections (removes bridges, weirs, culverts) and saving a _reconditioned.tif.
+version=0.1.0
+author=Alejandro Paladio Hernandez
+email=alejandropaladiohernandez@cnr.it
+icon=icon.png
+experimental=True
